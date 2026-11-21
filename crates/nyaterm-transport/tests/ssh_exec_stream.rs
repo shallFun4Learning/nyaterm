@@ -1,6 +1,9 @@
 //! Controlled SSH peer exercises lifecycle ordering on actual encrypted channels.
 use nyaterm_transport::ssh_execution::streaming::{SshExecEvent, stream_ssh_command};
-use nyaterm_transport::{SshHostKey, SshHostKeyDecision, SshHostKeyVerifier, SshSessionConfig};
+use nyaterm_transport::{
+    SshHostKey, SshHostKeyDecision, SshHostKeyVerifier, SshMultiplexHandle, SshSessionConfig,
+    open_ssh_multiplex_handle,
+};
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
 use russh::{ChannelId, Sig, server};
 use std::sync::{
@@ -8,16 +11,35 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, PartialEq, Eq)]
+enum PeerChannelEvent {
+    Opening(ChannelId),
+    Executing(ChannelId),
+    Closed(ChannelId),
+}
+
+#[derive(Default)]
 struct Peer {
     channels: Vec<russh::Channel<server::Msg>>,
     signals: Arc<AtomicUsize>,
     ignore_int: bool,
     allow_shell: bool,
     reject_next_shell: bool,
+    channel_events: Option<mpsc::UnboundedSender<PeerChannelEvent>>,
+    confirm_next_open: Option<oneshot::Receiver<()>>,
 }
+
+impl Peer {
+    fn report_channel_event(&self, event: PeerChannelEvent) {
+        if let Some(events) = &self.channel_events {
+            let _ = events.send(event);
+        }
+    }
+}
+
 impl server::Handler for Peer {
     type Error = russh::Error;
     async fn auth_none(&mut self, _: &str) -> Result<server::Auth, Self::Error> {
@@ -29,8 +51,20 @@ impl server::Handler for Peer {
         reply: server::ChannelOpenHandle,
         _: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        self.report_channel_event(PeerChannelEvent::Opening(channel.id()));
+        if let Some(confirmation) = self.confirm_next_open.take() {
+            let _ = confirmation.await;
+        }
         self.channels.push(channel);
         reply.accept().await;
+        Ok(())
+    }
+    async fn channel_close(
+        &mut self,
+        id: ChannelId,
+        _: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.report_channel_event(PeerChannelEvent::Closed(id));
         Ok(())
     }
     async fn exec_request(
@@ -39,6 +73,7 @@ impl server::Handler for Peer {
         command: &[u8],
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
+        self.report_channel_event(PeerChannelEvent::Executing(id));
         if command == b"reject" {
             session.channel_failure(id)?;
             session.close(id)?;
@@ -275,10 +310,19 @@ async fn peer_with_shell(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    let signals = Arc::new(AtomicUsize::new(0));
+    let (config, worker) = serve_peer(Peer {
+        signals: signals.clone(),
+        allow_shell,
+        ..Peer::default()
+    })
+    .await;
+    (config, signals, worker)
+}
+
+async fn serve_peer(peer: Peer) -> (SshSessionConfig, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let signals = Arc::new(AtomicUsize::new(0));
-    let count = signals.clone();
     let worker = tokio::spawn(async move {
         let key = russh::keys::PrivateKey::new(
             KeypairData::Ed25519(Ed25519Keypair::from_seed(&[17; 32])),
@@ -291,19 +335,7 @@ async fn peer_with_shell(
             ..Default::default()
         });
         let (socket, _) = listener.accept().await.unwrap();
-        let session = server::run_stream(
-            config,
-            socket,
-            Peer {
-                channels: Vec::new(),
-                signals: count,
-                ignore_int: false,
-                allow_shell,
-                reject_next_shell: false,
-            },
-        )
-        .await
-        .unwrap();
+        let session = server::run_stream(config, socket, peer).await.unwrap();
         let _ = session.await;
     });
     (
@@ -315,9 +347,128 @@ async fn peer_with_shell(
             host_key_verifier: Some(Arc::new(Verify)),
             ..Default::default()
         },
-        signals,
         worker,
     )
+}
+
+async fn connect_multiplex(config: &SshSessionConfig) -> SshMultiplexHandle {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || open_ssh_multiplex_handle(config).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn exec_timeout_closes_confirmed_and_late_confirmed_channels() {
+    use nyaterm_transport::ssh_execution::exec_ssh_command_with_multiplex;
+
+    let timeout = Duration::from_secs(15);
+    let test_deadline = Duration::from_secs(5);
+    for delay_confirmation in [false, true] {
+        let (confirm, confirmation) = oneshot::channel();
+        let (report, mut events) = mpsc::unbounded_channel();
+        let (config, server) = serve_peer(Peer {
+            channel_events: Some(report),
+            confirm_next_open: delay_confirmation.then_some(confirmation),
+            ..Peer::default()
+        })
+        .await;
+        let multiplex = connect_multiplex(&config).await;
+
+        let mut exec = Box::pin(exec_ssh_command_with_multiplex(
+            config.clone(),
+            multiplex.clone(),
+            b"wait".to_vec(),
+            timeout,
+        ));
+        let opening = async {
+            let Some(PeerChannelEvent::Opening(id)) = events.recv().await else {
+                panic!("expected an opening channel");
+            };
+            if !delay_confirmation {
+                assert_eq!(events.recv().await, Some(PeerChannelEvent::Executing(id)));
+            }
+            id
+        };
+        let channel = tokio::select! {
+            result = &mut exec => panic!("command exited early: {result:?}"),
+            result = tokio::time::timeout(test_deadline, opening) => result.unwrap(),
+        };
+
+        tokio::time::pause();
+        tokio::time::advance(timeout).await;
+        let result = exec.await;
+        tokio::time::resume();
+        assert_eq!(result.unwrap_err().to_string(), "remote command timed out");
+        if delay_confirmation {
+            confirm.send(()).unwrap();
+        }
+
+        let event = tokio::time::timeout(test_deadline, events.recv())
+            .await
+            .expect("the timed out command must release its channel");
+        assert_eq!(event, Some(PeerChannelEvent::Closed(channel)));
+        let output = exec_ssh_command_with_multiplex(
+            config,
+            multiplex.clone(),
+            b"exit_first".to_vec(),
+            test_deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_status, Some(0));
+        assert_eq!(output.stdout, "tail after exit");
+
+        tokio::task::spawn_blocking(move || multiplex.disconnect().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(test_deadline, server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn disconnect_releases_a_pending_exec_channel_open() {
+    use nyaterm_transport::ssh_execution::exec_ssh_command_with_multiplex;
+
+    let test_deadline = Duration::from_secs(5);
+    let (confirm, confirmation) = oneshot::channel();
+    let (report, mut events) = mpsc::unbounded_channel();
+    let (config, server) = serve_peer(Peer {
+        channel_events: Some(report),
+        confirm_next_open: Some(confirmation),
+        ..Peer::default()
+    })
+    .await;
+    let multiplex = connect_multiplex(&config).await;
+    let mut exec = Box::pin(exec_ssh_command_with_multiplex(
+        config,
+        multiplex.clone(),
+        b"wait".to_vec(),
+        Duration::from_secs(15),
+    ));
+    tokio::select! {
+        result = &mut exec => panic!("command exited early: {result:?}"),
+        event = tokio::time::timeout(test_deadline, events.recv()) => {
+            assert!(matches!(event.unwrap(), Some(PeerChannelEvent::Opening(_))));
+        }
+    }
+    drop(exec);
+
+    tokio::time::timeout(
+        test_deadline,
+        tokio::task::spawn_blocking(move || multiplex.disconnect().unwrap()),
+    )
+    .await
+    .expect("disconnect must finish while a channel open is pending")
+    .unwrap();
+    confirm.send(()).unwrap();
+    tokio::time::timeout(test_deadline, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, watch};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshMultiplexInfo {
@@ -53,7 +53,7 @@ pub(crate) struct SshMultiplexInner {
     pub(crate) forwarded_tcpip: ForwardedTcpIpRegistry,
     pub(crate) x11: X11Registry,
     pub(crate) primary_session: Arc<PrimarySessionGate>,
-    pub(crate) closed: AtomicBool,
+    pub(crate) closed: watch::Sender<bool>,
 }
 
 #[derive(Default)]
@@ -188,7 +188,7 @@ impl SshMultiplexHandle {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::Relaxed)
+        *self.inner.closed.borrow()
             || self
                 .inner
                 .target
@@ -228,7 +228,11 @@ impl SshMultiplexHandle {
     }
 
     pub fn disconnect(&self) -> anyhow::Result<()> {
-        if self.inner.closed.swap(true, Ordering::Relaxed) {
+        if !self.inner.closed.send_if_modified(|closed| {
+            let was_open = !*closed;
+            *closed = true;
+            was_open
+        }) {
             return Ok(());
         }
         let target = self.inner.target.clone();
@@ -406,7 +410,7 @@ pub fn open_ssh_multiplex_handle(
             forwarded_tcpip,
             x11,
             primary_session: Arc::new(PrimarySessionGate::new()),
-            closed: AtomicBool::new(false),
+            closed: watch::Sender::new(false),
         }),
     })
 }

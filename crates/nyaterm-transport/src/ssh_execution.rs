@@ -1,10 +1,11 @@
 //! SSH command execution, cancellation, and runtime adapters.
+mod channel;
 pub mod streaming;
 pub mod sudo;
-use crate::{
-    SshClientHandler, SshMultiplexHandle, SshSessionConfig, open_authenticated_ssh_handle,
-};
-use russh::{ChannelMsg, Disconnect, client};
+
+use self::channel::ExecChannel;
+use crate::{SshMultiplexHandle, SshSessionConfig, open_authenticated_ssh_handle};
+use russh::{ChannelMsg, Disconnect};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -127,7 +128,8 @@ pub async fn exec_ssh_command(
     tokio::time::timeout(timeout, async move {
         config.ensure_shell_available()?;
         let (handle, jump_handles) = open_authenticated_ssh_handle(&config).await?;
-        let channel = open_exec_channel_on_handle(&handle, command).await?;
+        let mut channel = ExecChannel::open(&handle).await?;
+        channel.request(command).await?;
         let output = collect_exec_channel(channel).await?;
         let _ = handle
             .disconnect(Disconnect::ByApplication, "ssh exec completed", "en")
@@ -183,26 +185,21 @@ pub fn run_ssh_command_with_input(
         config
             .attempt
             .until_cancelled(tokio::time::timeout(timeout, async {
-                let (channel, owned) = if let Some(multiplex) = multiplex.as_ref() {
-                    let handle = multiplex.exec_target_handle().await;
-                    let handle = handle.lock().await;
-                    (
-                        open_exec_channel_on_handle(&handle, command.into_bytes()).await?,
-                        None,
-                    )
+                let (mut channel, owned) = if let Some(multiplex) = multiplex.as_ref() {
+                    (ExecChannel::open_shared(multiplex).await?, None)
                 } else {
                     let (handle, jumps) = open_authenticated_ssh_handle(&config).await?;
-                    let channel =
-                        open_exec_channel_on_handle(&handle, command.into_bytes()).await?;
+                    let channel = ExecChannel::open(&handle).await?;
                     (channel, Some((handle, jumps)))
                 };
+                channel.request(command.into_bytes()).await?;
                 if let Some(secret) = input {
                     let bytes = zeroize::Zeroizing::new(
                         format!("{}\n", secret.expose_secret()).into_bytes(),
                     );
-                    channel.data(&bytes[..]).await?;
+                    channel.channel().data(&bytes[..]).await?;
                 }
-                channel.eof().await?;
+                channel.channel().eof().await?;
                 let output = collect_exec_channel(channel).await;
                 if let Some((handle, jumps)) = owned {
                     let _ = handle
@@ -236,44 +233,24 @@ pub async fn exec_ssh_command_with_multiplex(
     tokio::time::timeout(timeout, async move {
         config.ensure_shell_available()?;
         multiplex.inner.attempt.ensure_shell_available()?;
-        let handle = multiplex.exec_target_handle().await;
-        let channel = {
-            let handle = handle.lock().await;
-            open_exec_channel_on_handle(&handle, command).await?
-        };
+        let mut channel = ExecChannel::open_shared(&multiplex).await?;
+        channel.request(command).await?;
         collect_exec_channel(channel).await
     })
     .await
     .map_err(|_| anyhow::anyhow!("remote command timed out"))?
 }
 
-async fn open_exec_channel_on_handle(
-    handle: &client::Handle<SshClientHandler>,
-    command: Vec<u8>,
-) -> anyhow::Result<russh::Channel<client::Msg>> {
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to open exec channel: {error}"))?;
-    channel
-        .exec(true, command)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to execute remote command: {error}"))?;
-    Ok(channel)
-}
-
-async fn collect_exec_channel(
-    mut channel: russh::Channel<client::Msg>,
-) -> anyhow::Result<RemoteCommandOutput> {
+async fn collect_exec_channel(mut channel: ExecChannel) -> anyhow::Result<RemoteCommandOutput> {
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit_status = None;
     let mut eof_seen = false;
     loop {
-        match channel.wait().await {
+        match channel.channel().wait().await {
             Some(ChannelMsg::Success) => {}
             Some(ChannelMsg::Failure) => {
-                let _ = channel.close().await;
+                channel.close().await;
                 return Err(ExecRequestDenied.into());
             }
             Some(ChannelMsg::Data { data }) => {
@@ -297,7 +274,7 @@ async fn collect_exec_channel(
         }
     }
 
-    let _ = channel.close().await;
+    channel.close().await;
     Ok(RemoteCommandOutput {
         stdout,
         stderr,
